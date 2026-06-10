@@ -342,6 +342,7 @@ static void bq_mux_set(uint8_t id, uint8_t bank, uint8_t chan) {
   bq_write_sgl(id, GPIO_CONF2, (uint8_t)((en0 << 3) | a2));
   bq_write_sgl(id, GPIO_CONF3, (uint8_t)((en1 << 3) | GM_ADC));
   bq_write_sgl(id, GPIO_CONF4, (uint8_t)((GM_OFF << 3) | GM_ADC));
+  bq_write_sgl(id, ADC_CTRL1, 0x0E);
 }
 
 static bool bq_mux_read(uint8_t id, uint8_t gpioNum, float& tC) {
@@ -369,7 +370,10 @@ static bool bq_read_temps(uint8_t id, float dst[16]) {
     if (cell == 0 || cell == 8) delayMicroseconds(SETTLE_US);
     delayMicroseconds(SETTLE_US);
     float tC = NAN;
-    if (!bq_mux_read(id, gpioOut, tC)) ok = false;
+    if (!bq_mux_read(id, gpioOut, tC)) {
+      Serial.printf("[BQ] temp read failed: id%d cell%d\n", id, cell + 1);
+      ok = false;
+    }
     dst[cell] = tC;
   }
   return ok;
@@ -402,6 +406,7 @@ static bool bq_init() {
   bq_hwrst(); delay(10);
   bq_wake(); delay(15);
   bq_wake(); delay(15);
+  bq_write_sgl(ID_BASE, CONTROL1, 0x20); delay(100); // BQ79600 SEND_WAKE to BQ79616 stack
   bq_sta();  delay(5);
   bq_auto_address(); delay(5);
 
@@ -649,7 +654,10 @@ static void printCellData() {
 static void tickMonitor() {
   bool all_v_ok = true;
   for (uint8_t s = 0; s < NUM_STACK_DEVS; s++) {
-    if (!bq_read_voltages(s + 1, g_volts + s * 16)) all_v_ok = false;
+    if (!bq_read_voltages(s + 1, g_volts + s * 16)) {
+      Serial.printf("[BQ] voltage read failed: id%d\n", s + 1);
+      all_v_ok = false;
+    }
   }
   if (!all_v_ok) { enterFault(FAULT_BQ_COMMS); return; }
   calc_stats(g_volts, PACK_CELLS, g_vstats);
