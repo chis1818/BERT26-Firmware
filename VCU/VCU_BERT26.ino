@@ -62,7 +62,7 @@ static const int APPS_2_RAW_MAX = 4095;
 
 static const float APPS_EMA_ALPHA          = 0.35f;
 static const float APPS_IMPLAUSIBLE_PCT    = 10.0f;
-static const float PEDAL_ZERO_DEADBAND_PCT = 3.0f;
+static const float PEDAL_ZERO_DEADBAND_PCT = 5.0f;
 static const float MAX_TORQUE_NM           = 200.0f;
 static const float BSPC_APPS_THRESHOLD_PCT = 25.0f;
 
@@ -110,6 +110,7 @@ static constexpr uint32_t SCREEN_PERIOD_MS = 100;
 static constexpr uint32_t STARTUP_BMS_IMD_FAULT_DELAY_MS = 10000;
 static constexpr uint32_t FAULT_DISPLAY_CYCLE_MS = 1500;
 static constexpr uint8_t DASHBOARD_MAX_FAULT_TEXTS = 48;
+static constexpr uint32_t RTD_BLOCKED_LOG_PERIOD_MS = 1000;
 
 // BERT26 vehicle CAN definitions for human-readable log translations.
 static constexpr uint32_t BMS_STATUS_2026_ID        = 0x310;
@@ -415,6 +416,7 @@ bool readReadyButtonPressed();
 bool rtdInputsReady();
 bool readyForRtdButton();
 void refreshRtdStateFromInputs();
+void logRtdBlockedReason();
 void handleRtdButtonPressed();
 void setRtdState(RtdState newState);
 void dropReadyToDrive(const char *reason);
@@ -2777,8 +2779,12 @@ void updatePedal() {
   appsPlausible = percentError <= APPS_IMPLAUSIBLE_PCT;
 
   pedalPct = (apps1Pct + apps2Pct) * 0.5f;
-  if (pedalPct < PEDAL_ZERO_DEADBAND_PCT) {
+  if (pedalPct <= PEDAL_ZERO_DEADBAND_PCT) {
     pedalPct = 0.0f;
+  } else {
+    // Rescale the remaining travel back up to 0-100% so output ramps
+    // smoothly from zero instead of jumping past the deadband.
+    pedalPct = (pedalPct - PEDAL_ZERO_DEADBAND_PCT) * 100.0f / (100.0f - PEDAL_ZERO_DEADBAND_PCT);
   }
 
   bool bspcWasLatched = bspcLatched;
@@ -2902,7 +2908,42 @@ void refreshRtdStateFromInputs() {
     return;
   }
 
-  setRtdState(rtdInputsReady() ? RTD_STATE_READY_FOR_BUTTON : RTD_STATE_FAULT_BLOCKED);
+  bool inputsReady = rtdInputsReady();
+  if (!inputsReady) {
+    logRtdBlockedReason();
+  }
+
+  setRtdState(inputsReady ? RTD_STATE_READY_FOR_BUTTON : RTD_STATE_FAULT_BLOCKED);
+}
+
+// Periodically prints why RTD_STATE_FAULT_BLOCKED hasn't cleared, e.g. so a
+// stuck contactor/fault/IMD flag after an HV power cycle shows up in the
+// serial log instead of just leaving the dashboard stuck on "N".
+void logRtdBlockedReason() {
+  static uint32_t lastLogMs = 0;
+  uint32_t now = millis();
+  if (now - lastLogMs < RTD_BLOCKED_LOG_PERIOD_MS) {
+    return;
+  }
+  lastLogMs = now;
+
+  if (!bmsImdFaultDetectionArmed()) {
+    Serial.println("[RTD] Blocked: startup fault-detection delay active");
+    return;
+  }
+
+  Serial.print("[RTD] Blocked:");
+  if (imdFault)            Serial.print(" imdFault");
+  if (bmsFault)            Serial.print(" bmsFault");
+  if (contactorsOpen())    Serial.print(" contactorsOpen");
+  if (!appsPlausible)      Serial.print(" appsImplausible");
+  if (imdCanTimedOut)      Serial.print(" imdCanTimedOut");
+  if (bmsTimedOut)         Serial.print(" bmsTimedOut");
+  Serial.print(" bmsFlags=0x");
+  printCanHexByte(bmsFlags);
+  Serial.print(" imdWarnAlarms=0x");
+  Serial.print(imdWarnAlarms, HEX);
+  Serial.println();
 }
 
 void handleRtdButtonPressed() {
