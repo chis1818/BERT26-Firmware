@@ -67,11 +67,10 @@ static const int ADC_MAX_COUNTS      = (1 << ADC_RESOLUTION_BITS) - 1;
 static const float ADC_REFERENCE_VOLTAGE = 3.3f;
 
 // Raw ADC calibration ranges from the BERT26 pedal test sketch.
-static const int APPS_1_RAW_MIN = 561;
-static const int APPS_1_RAW_MAX = 2305;
-static const int APPS_2_RAW_MIN = 2349;
-static const int APPS_2_RAW_MAX = 4089;
-
+static const int APPS_1_RAW_MIN = 325;
+static const int APPS_1_RAW_MAX = 2400;
+static const int APPS_2_RAW_MIN = 2130;
+static const int APPS_2_RAW_MAX = 4013;
 
 static const float APPS_EMA_ALPHA          = 0.35f;
 static const float APPS_IMPLAUSIBLE_PCT    = 10.0f;
@@ -138,7 +137,7 @@ static constexpr float MPH_PER_RPM           = 0.014005f;
 
 static constexpr uint32_t BMS_TIMEOUT_MS = 10000;
 static constexpr uint32_t SCREEN_PERIOD_MS = 100;
-static constexpr uint32_t STARTUP_BMS_IMD_FAULT_DELAY_MS = 10000;
+static constexpr uint32_t STARTUP_BMS_IMD_FAULT_DELAY_MS = 12000;
 static constexpr uint32_t FAULT_DISPLAY_CYCLE_MS = 1500;
 static constexpr uint32_t FAULT_BANNER_DURATION_MS = 5000;
 // GLV battery sits around 12-13 V; show the readout red once it sags below this.
@@ -176,7 +175,7 @@ static const int TSSI_LED_GREEN = 4;
 
 static constexpr uint32_t TSSI_BLINK_PERIOD_MS    = 500;  // 2 Hz
 static constexpr uint32_t TSSI_BLINK_ON_MS        = 250;
-static constexpr uint32_t IMD_HEARTBEAT_TIMEOUT_MS = 2000;
+static constexpr uint32_t IMD_HEARTBEAT_TIMEOUT_MS = 5000;
 static constexpr uint32_t IMD_GET_REQ_PERIOD_MS    = 500;
  
 static constexpr uint16_t IMD_FAULT_BITS_MASK = (1u << 0) | (1u << 1) | (1u << 2) |
@@ -580,7 +579,9 @@ void setup() {
   while (!Serial && millis() < 1500) {}
 
   Serial.println("BERT26 VCU starting");
-  Serial.println("[Startup] BMS/IMD fault detection delayed for 10000 ms");
+  Serial.print("[Startup] BMS/IMD fault detection delayed for ");
+  Serial.print(STARTUP_BMS_IMD_FAULT_DELAY_MS);
+  Serial.println(" ms");
 
   setupDisplay();
 
