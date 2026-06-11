@@ -81,11 +81,8 @@ static const uint32_t APPS_IMPLAUSIBILITY_PERSIST_MS = 100;
 // sensor fault (short/open), not pedal travel.
 static const int APPS_RAW_FAULT_MARGIN = 150;
 static const float PEDAL_ZERO_DEADBAND_PCT = 7.0f;
-static const float MAX_TORQUE_NM           = 60.0f;
+static const float MAX_TORQUE_NM           = 120.0f;
 static const float BSPC_APPS_THRESHOLD_PCT = 25.0f;
-// EV.4.7: once BSPC latches, torque stays inhibited (brake or not) until
-// pedal travel falls below this reset point.
-static const float BSPC_APPS_RESET_PCT     = 5.0f;
 
 // Calculated from voltage divider at input. R1 = 5.6k, R2 = 15k, Gain = 0.728
 // This comment was written by a human, me
@@ -204,7 +201,9 @@ uint32_t appsDisagreeStartMs = 0;
 // Names the kind of APPS problem (channel disagreement vs. out-of-range
 // sensor) for the dash fault texts; only meaningful while not plausible.
 const char *appsFaultText = "APPS Disagree";
-bool bspcLatched = false;
+// True while brake + accelerator >25% travel are applied together; commands
+// zero torque only for as long as the condition holds (no latch).
+bool bspcActive = false;
 bool appsFilterInitialized = false;
 int rawApps1Last = 0;
 int rawApps2Last = 0;
@@ -918,12 +917,12 @@ void drawDashboard() {
                           lastPedal, sizeof(lastPedal), lastPedalColor, force);
 
   // Shows the torque actually loaded into the PM100 command frame; red while
-  // RTD is latched but torque is being suppressed (BSPC latch / APPS fault).
+  // RTD is latched but torque is being suppressed (BSPC / APPS fault).
   {
     uint16_t torqueColor;
     if (!readyToDriveLatched) {
       torqueColor = ST7735_YELLOW;
-    } else if (bspcLatched || !appsPlausible) {
+    } else if (bspcActive || !appsPlausible) {
       torqueColor = ST7735_RED;
     } else {
       torqueColor = ST7735_GREEN;
@@ -1170,8 +1169,8 @@ void collectDashboardFaults(DashboardFaultList &faults) {
     appendDashboardFault(faults, appsFaultText);
   }
 
-  if (bspcLatched) {
-    appendDashboardFault(faults, "BSPC Latch");
+  if (bspcActive) {
+    appendDashboardFault(faults, "BSPC Zero Trq");
   }
 }
 
@@ -3042,7 +3041,7 @@ void updatePm100CommandState() {
   uint8_t inverterEnable = 0x00;
 
   bool driveSelected = readyToDriveLatched && (driveMode == 'D');
-  // APPS implausibility and a BSPC latch keep the inverter enabled but command
+  // APPS implausibility and an active BSPC keep the inverter enabled but command
   // zero torque: updatePedal already forces desiredTorqueNm to 0 for both.
   bool torqueAllowed = driveSelected && !anyFaultActive() && !contactorsOpen();
 
@@ -3174,22 +3173,18 @@ void updatePedal() {
     pedalPct = (pedalPct - PEDAL_ZERO_DEADBAND_PCT) * 100.0f / (100.0f - PEDAL_ZERO_DEADBAND_PCT);
   }
 
-  // EV.4.7: brake (light-braking threshold) + accelerator >25% latches zero
-  // torque. The latch holds through brake release and only clears once the
-  // accelerator drops below 5% travel.
-  bool bspcWasLatched = bspcLatched;
-  if (braking && pedalTravelPct > BSPC_APPS_THRESHOLD_PCT) {
-    bspcLatched = true;
-  } else if (bspcLatched && pedalTravelPct < BSPC_APPS_RESET_PCT) {
-    bspcLatched = false;
-  }
-  if (bspcLatched != bspcWasLatched) {
-    Serial.println(bspcLatched ? "[BSPC] Latched; torque inhibited until pedal <5%"
-                               : "[BSPC] Cleared; pedal below reset threshold");
+  // BSPC: zero torque while the brake (light-braking threshold) and
+  // accelerator >25% travel are applied together. Torque returns as soon as
+  // either pedal is released.
+  bool bspcWasActive = bspcActive;
+  bspcActive = braking && pedalTravelPct > BSPC_APPS_THRESHOLD_PCT;
+  if (bspcActive != bspcWasActive) {
+    Serial.println(bspcActive ? "[BSPC] Active; commanding zero torque"
+                              : "[BSPC] Cleared");
   }
 
   if (appsPlausible) {
-    desiredTorqueNm = bspcLatched ? 0.0f : (pedalPct / 100.0f) * MAX_TORQUE_NM;
+    desiredTorqueNm = bspcActive ? 0.0f : (pedalPct / 100.0f) * MAX_TORQUE_NM;
   } else {
     desiredTorqueNm = 0.0f;
     if (wasPlausible) {
@@ -3238,7 +3233,7 @@ void logAppsTelemetry() {
   Serial.print("Nm cmd=");
   Serial.print(commandedTorqueNm, 1);
   Serial.print("Nm bspc=");
-  Serial.print(bspcLatched ? "LATCHED" : "clear");
+  Serial.print(bspcActive ? "ACTIVE" : "clear");
   Serial.print(" plausible=");
   Serial.println(appsPlausible ? "YES" : "NO");
 }
