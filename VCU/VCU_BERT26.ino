@@ -41,8 +41,20 @@ static const int BRAKE_LIGHT_PIN  = 5;     // HIGH = brake light on
 static const int FAN_1_PIN        = 1;
 static const int FAN_2_PIN        = 2;
 
-static constexpr uint32_t FAN_PWM_FREQUENCY_HZ = 1000;
+// Shutdown-circuit status inputs: HIGH = signal OK (green), LOW = tripped (red).
+static const int BSPD_STATUS_PIN  = 24;
+static const int IMD_STATUS_PIN   = 25;
+static const int BMS_STATUS_PIN   = 28;
+
+static constexpr uint32_t FAN_PWM_FREQUENCY_HZ = 20000;
 static constexpr uint8_t FAN_PWM_WRITE_MAX = 255;
+
+// Fan duty tracks the hotter of motor/inverter temp: 20% at room temp,
+// ramping linearly to 100% by 40 C (system max is 50 C).
+static const float FAN_TEMP_MIN_C = 25.0f;
+static const float FAN_TEMP_MAX_C = 40.0f;
+static const int FAN_DUTY_MIN_PERCENT = 20;
+static const int FAN_DUTY_MAX_PERCENT = 100;
 
 // EURO-XPD analog input pins from VCU_Pedal_Read_Test.
 static const int APPS_1_PIN = 38;         // Inverted channel
@@ -55,23 +67,33 @@ static const int ADC_MAX_COUNTS      = (1 << ADC_RESOLUTION_BITS) - 1;
 static const float ADC_REFERENCE_VOLTAGE = 3.3f;
 
 // Raw ADC calibration ranges from the BERT26 pedal test sketch.
-static const int APPS_1_RAW_MIN = 380;
-static const int APPS_1_RAW_MAX = 2313;
-static const int APPS_2_RAW_MIN = 2313;
-static const int APPS_2_RAW_MAX = 4095;
+static const int APPS_1_RAW_MIN = 561;
+static const int APPS_1_RAW_MAX = 2305;
+static const int APPS_2_RAW_MIN = 2349;
+static const int APPS_2_RAW_MAX = 4089;
+
 
 static const float APPS_EMA_ALPHA          = 0.35f;
 static const float APPS_IMPLAUSIBLE_PCT    = 10.0f;
-static const float PEDAL_ZERO_DEADBAND_PCT = 5.0f;
-static const float MAX_TORQUE_NM           = 200.0f;
+// T.4.2.5 allows up to 100 ms of >10% channel deviation before it counts as
+// an implausibility, so brief sensor/connector noise no longer drops RTD.
+static const uint32_t APPS_IMPLAUSIBILITY_PERSIST_MS = 100;
+// A raw count this far outside a channel's calibrated span means a wiring or
+// sensor fault (short/open), not pedal travel.
+static const int APPS_RAW_FAULT_MARGIN = 150;
+static const float PEDAL_ZERO_DEADBAND_PCT = 7.0f;
+static const float MAX_TORQUE_NM           = 60.0f;
 static const float BSPC_APPS_THRESHOLD_PCT = 25.0f;
+// EV.4.7: once BSPC latches, torque stays inhibited (brake or not) until
+// pedal travel falls below this reset point.
+static const float BSPC_APPS_RESET_PCT     = 5.0f;
 
 // Calculated from voltage divider at input. R1 = 5.6k, R2 = 15k, Gain = 0.728
 // This comment was written by a human, me
 static const float BSE_SENSOR_MIN_VOLTAGE  = 0.364f;
 static const float BSE_SENSOR_MAX_VOLTAGE  = 3.277f;
-static const int BSE_1_BRAKING_RAW_THRESHOLD = 550;
-static const int BSE_2_BRAKING_RAW_THRESHOLD = 550;
+static const int BSE_1_BRAKING_RAW_THRESHOLD = 600;
+static const int BSE_2_BRAKING_RAW_THRESHOLD = 800;
 static const int BSE_1_HARD_BRAKING_RAW_THRESHOLD = 2000;
 static const int BSE_2_HARD_BRAKING_RAW_THRESHOLD = 2100;
 
@@ -88,7 +110,7 @@ static constexpr bool CAN_TRANSLATION_SERIAL_ENABLED = true;
 static constexpr bool APPS_SERIAL_LOG_ENABLED = true;
 
 // Set false to bypass brake-press requirement when bench testing without pedals.
-static constexpr bool REQUIRE_BRAKE_FOR_RTD = false;
+static constexpr bool REQUIRE_BRAKE_FOR_RTD = true;
 static constexpr uint32_t APPS_SERIAL_LOG_PERIOD_MS = 100;
 
 // Cascadia PM100DX command frame from BERT25.
@@ -98,8 +120,17 @@ static constexpr uint32_t PM100_TEMPERATURE_3_FRAME_ID = 0x0A2;
 static constexpr uint32_t PM100_RPM_FRAME_ID = 0x0A5;
 static constexpr uint32_t PM100_CURRENT_INFO_FRAME_ID = 0x0A6;
 static constexpr uint32_t PM100_VOLTAGE_INFO_FRAME_ID = 0x0A7;
+static constexpr uint32_t PM100_INTERNAL_VOLTAGES_FRAME_ID = 0x0A9;
 static constexpr uint32_t PM100_FAULT_CODES_FRAME_ID = 0x0AB;
 static constexpr uint32_t PM100_TORQUE_CAPABILITY_FRAME_ID = 0x0B1;
+static constexpr uint32_t PM100_PARAM_COMMAND_ID  = 0x0C1;
+static constexpr uint32_t PM100_PARAM_RESPONSE_ID = 0x0C2;
+// EEPROM parameter 148 = "CAN Active Messages Lo Word"; bit 0x0200 enables the
+// 0x0A9 Internal Voltages broadcast that carries the GLV (12V) voltage.
+static constexpr uint16_t PM100_PARAM_CAN_ACTIVE_MSGS = 148;
+static constexpr uint32_t PM100_BROADCAST_ENABLE_DELAY_MS = 5000;
+static constexpr uint32_t PM100_BROADCAST_ENABLE_RETRY_MS = 5000;
+static constexpr uint8_t PM100_BROADCAST_ENABLE_MAX_ATTEMPTS = 3;
 static constexpr uint16_t TORQUE_SCALE       = 10;      // 0.1 Nm per LSB
 static constexpr uint32_t CMD_PERIOD_MS      = 10;      // 100 Hz
 static constexpr uint32_t PM100_CMD_PERIOD_US = CMD_PERIOD_MS * 1000u;
@@ -109,6 +140,9 @@ static constexpr uint32_t BMS_TIMEOUT_MS = 10000;
 static constexpr uint32_t SCREEN_PERIOD_MS = 100;
 static constexpr uint32_t STARTUP_BMS_IMD_FAULT_DELAY_MS = 10000;
 static constexpr uint32_t FAULT_DISPLAY_CYCLE_MS = 1500;
+static constexpr uint32_t FAULT_BANNER_DURATION_MS = 5000;
+// GLV battery sits around 12-13 V; show the readout red once it sags below this.
+static constexpr float GLV_LOW_VOLTAGE_WARN_V = 11.5f;
 static constexpr uint8_t DASHBOARD_MAX_FAULT_TEXTS = 48;
 static constexpr uint32_t RTD_BLOCKED_LOG_PERIOD_MS = 1000;
 
@@ -162,7 +196,15 @@ float apps1Pct = 0.0f;
 float apps2Pct = 0.0f;
 float pedalPct = 0.0f;
 float desiredTorqueNm = 0.0f;
+// Torque actually loaded into the PM100 command frame this cycle; this is
+// what the dashboard shows so the display always matches the bus.
+float commandedTorqueNm = 0.0f;
 bool appsPlausible = false;
+bool appsDisagreeing = false;
+uint32_t appsDisagreeStartMs = 0;
+// Names the kind of APPS problem (channel disagreement vs. out-of-range
+// sensor) for the dash fault texts; only meaningful while not plausible.
+const char *appsFaultText = "APPS Disagree";
 bool bspcLatched = false;
 bool appsFilterInitialized = false;
 int rawApps1Last = 0;
@@ -176,11 +218,13 @@ float bse2Pct = 0.0f;
 bool braking = false;
 bool hardBraking = false;
 
-// Change these 0-100 variables at any time to update fan PWM duty cycle.
-int fan1DutyPercent = 50;
-int fan2DutyPercent = 50;
+// Duty cycles are set automatically from motor/inverter temps unless a
+// manual override is entered over serial (digits = override, 'a' = auto).
+int fan1DutyPercent = FAN_DUTY_MIN_PERCENT;
+int fan2DutyPercent = FAN_DUTY_MIN_PERCENT;
 int fan1LastDutyPercent = -1;
 int fan2LastDutyPercent = -1;
+bool fanManualOverride = false;
 
 float packVoltage = 0.0f;
 float packCurrent = 0.0f;
@@ -188,6 +232,15 @@ float inverterDcBusVoltage = 0.0f;
 float inverterDcBusCurrent = 0.0f;
 bool haveInverterVoltageInfo = false;
 bool haveInverterCurrentInfo = false;
+// GLV (12V system) voltage reported by the PM100 Internal Voltages frame.
+float glvVoltage = 0.0f;
+bool haveGlvVoltage = false;
+// If the inverter is talking but 0x0A9 never arrives, its broadcast mask has
+// Internal Voltages disabled; we write parameter 148 once to turn it back on.
+bool havePm100Traffic = false;
+uint32_t firstPm100FrameMs = 0;
+uint8_t pm100BroadcastEnableAttempts = 0;
+uint32_t pm100BroadcastEnableLastTxMs = 0;
 float powerKw = 0.0f;
 uint8_t stateOfChargePct = 0;
 uint8_t batteryTempC = 0;
@@ -237,6 +290,13 @@ RtdState rtdState = RTD_STATE_FAULT_BLOCKED;
 bool readyToDriveLatched = false;
 
 bool readyButtonLast = false;
+
+// Fault banner: a red strip over the drive-button row naming the most recent
+// fault, shown for FAULT_BANNER_DURATION_MS after each fault event.
+char faultBannerText[48] = "";
+uint32_t faultBannerUntilMs = 0;
+bool faultBannerVisible = false;
+bool faultBannerDirty = false;
 
 int backlightBrightness = 255;
 bool screenDirty = true;
@@ -321,8 +381,12 @@ const char *pm100PostFaultName(uint8_t bit);
 const char *pm100RunFaultName(uint8_t bit);
 void drawStatusText(int x, int y, const char *label, const char *value, uint16_t valueColor);
 void drawStatusText(int x, int y, const char *label, int value, const char *units, uint16_t valueColor);
+void drawShutdownStatusIndicators(bool force);
+void drawShutdownStatusIndicator(int x, int y, const char *label, bool high,
+                                 int &lastState, bool force);
 
 void setupFans();
+void updateFanDutyFromTemps();
 void serviceFans();
 uint8_t dutyPercentToFanPwmWrite(int dutyPercent);
 
@@ -356,6 +420,7 @@ void printPm100Temperatures3Translation(const CAN_message_t &msg);
 void printPm100MotorPositionTranslation(const CAN_message_t &msg);
 void printPm100CurrentInfoTranslation(const CAN_message_t &msg);
 void printPm100VoltageInfoTranslation(const CAN_message_t &msg);
+void printPm100InternalVoltagesTranslation(const CAN_message_t &msg);
 void printPm100FaultCodesTranslation(const CAN_message_t &msg);
 void printPm100TorqueCapabilityTranslation(const CAN_message_t &msg);
 void printRawPayloadFrom(const CAN_message_t &msg, uint8_t startIndex);
@@ -392,7 +457,11 @@ void handlePm100Temperatures3Frame(const CAN_message_t &msg);
 void handlePm100RpmFrame(const CAN_message_t &msg);
 void handlePm100CurrentInfoFrame(const CAN_message_t &msg);
 void handlePm100VoltageInfoFrame(const CAN_message_t &msg);
+void handlePm100InternalVoltagesFrame(const CAN_message_t &msg);
 void handlePm100FaultCodesFrame(const CAN_message_t &msg);
+void handlePm100ParamResponseFrame(const CAN_message_t &msg);
+void servicePm100BroadcastEnable();
+void sendPm100BroadcastEnable();
 void setupTssi();
 void serviceTssi();
 void requestImdWarnings();
@@ -420,6 +489,10 @@ void logRtdBlockedReason();
 void handleRtdButtonPressed();
 void setRtdState(RtdState newState);
 void dropReadyToDrive(const char *reason);
+const char *rtdDropCauseText();
+void showFaultBanner(const char *text);
+void serviceFaultBanner();
+void drawFaultBanner(bool force);
 const char *rtdStateName(RtdState state);
 void setDriveMode(char newDriveMode);
 uint8_t pm100DirectionByteForMode(char mode);
@@ -446,6 +519,7 @@ static const CanFrameTranslation CAN_FRAME_TRANSLATIONS[] = {
   {PM100_RPM_FRAME_ID, "PM100 Motor Position", printPm100MotorPositionTranslation},
   {PM100_CURRENT_INFO_FRAME_ID, "PM100 Current Information", printPm100CurrentInfoTranslation},
   {PM100_VOLTAGE_INFO_FRAME_ID, "PM100 Voltage Information", printPm100VoltageInfoTranslation},
+  {PM100_INTERNAL_VOLTAGES_FRAME_ID, "PM100 Internal Voltages", printPm100InternalVoltagesTranslation},
   {PM100_FAULT_CODES_FRAME_ID, "PM100 Fault Codes", printPm100FaultCodesTranslation},
   {PM100_TORQUE_CAPABILITY_FRAME_ID, "PM100 Torque Capability", printPm100TorqueCapabilityTranslation}
 };
@@ -494,6 +568,11 @@ void setup() {
   pinMode(BRAKE_LIGHT_PIN, OUTPUT);
   digitalWrite(BRAKE_LIGHT_PIN, LOW);
 
+  // Pulldowns so a disconnected status line reads LOW and shows red.
+  pinMode(BSPD_STATUS_PIN, INPUT_PULLDOWN);
+  pinMode(IMD_STATUS_PIN, INPUT_PULLDOWN);
+  pinMode(BMS_STATUS_PIN, INPUT_PULLDOWN);
+
   setupTssi();
   setupVehicleCan();
   setupPm100CommandTimer();
@@ -511,6 +590,7 @@ void setup() {
 // ---------------- Main loop ----------------
 void loop() {
   handleSerialFanDutyInput();
+  updateFanDutyFromTemps();
   serviceFans();
   receiveCanFrames();
   updatePedal();
@@ -520,18 +600,20 @@ void loop() {
   serviceReadyToDrive();
   serviceBuzzer();
   serviceTssi();
+  serviceFaultBanner();
   handleTouch();
 
   uint32_t now = millis();
   if (bmsImdFaultDetectionArmed() && haveBmsStatus && (now - lastBmsRxMs > BMS_TIMEOUT_MS)) {
     if (!bmsTimedOut) {
       Serial.println("[BMS] Status timeout"); //,disabling torque
+      showFaultBanner("BMS Timeout");
       screenDirty = true;
     }
     bmsTimedOut = true;
     bmsActive = false;
     bmsFault = true;
-    dropReadyToDrive("BMS status timeout");
+    dropReadyToDrive("BMS Timeout");
   }
 
   if (haveInverterVoltageInfo && haveInverterCurrentInfo) {
@@ -542,6 +624,7 @@ void loop() {
   speedMph = (int)roundf((float)motorRpm * MPH_PER_RPM);
   updatePm100CommandState();
   servicePm100TxLogging();
+  servicePm100BroadcastEnable();
 
   static uint32_t lastDrawMs = 0;
   if (screenDirty || now - lastDrawMs >= SCREEN_PERIOD_MS) {
@@ -558,6 +641,42 @@ void setupFans() {
   analogWriteFrequency(FAN_1_PIN, FAN_PWM_FREQUENCY_HZ);
   analogWriteFrequency(FAN_2_PIN, FAN_PWM_FREQUENCY_HZ);
   serviceFans();
+}
+
+void updateFanDutyFromTemps() {
+  if (fanManualOverride) {
+    return;
+  }
+
+  // Drive the fans from the hotter of the PM100 motor and inverter temps.
+  bool haveTemp = false;
+  float tempC = 0.0f;
+  if (haveInverterTemp) {
+    tempC = (float)inverterTempTenthsC / 10.0f;
+    haveTemp = true;
+  }
+  if (havePm100MotorTemp) {
+    float motorTempC = (float)pm100MotorTempTenthsC / 10.0f;
+    if (!haveTemp || motorTempC > tempC) {
+      tempC = motorTempC;
+    }
+    haveTemp = true;
+  }
+
+  int duty;
+  if (!haveTemp || tempC <= FAN_TEMP_MIN_C) {
+    duty = FAN_DUTY_MIN_PERCENT;
+  } else if (tempC >= FAN_TEMP_MAX_C) {
+    duty = FAN_DUTY_MAX_PERCENT;
+  } else {
+    float span = FAN_TEMP_MAX_C - FAN_TEMP_MIN_C;
+    float fraction = (tempC - FAN_TEMP_MIN_C) / span;
+    duty = FAN_DUTY_MIN_PERCENT +
+           (int)(fraction * (float)(FAN_DUTY_MAX_PERCENT - FAN_DUTY_MIN_PERCENT) + 0.5f);
+  }
+
+  fan1DutyPercent = duty;
+  fan2DutyPercent = duty;
 }
 
 void serviceFans() {
@@ -625,19 +744,26 @@ void handleSerialFanDutyInput() {
       if (index < sizeof(input) - 1) {
         input[index++] = c;
       }
+    } else if (c == 'a' || c == 'A') {
+      // Return fan control to automatic temperature-based duty.
+      fanManualOverride = false;
+      Serial.println("[Fans] Automatic temperature control resumed");
+      index = 0;
     } else if (c == '\n' || c == '\r') {
       if (index > 0) {
         input[index] = '\0';
         int value = atoi(input);
-        // Temporary fan test input: enter 0-100 to set both fan PWM duties.
+        // Manual override: enter 0-100 to force both fan PWM duties.
+        // Send 'a' to return to automatic temperature control.
         if (value >= 0 && value <= 100) {
+          fanManualOverride = true;
           fan1DutyPercent = value;
           fan2DutyPercent = value;
-          Serial.print("[Fans] Temporary duty set to ");
+          Serial.print("[Fans] Manual override duty set to ");
           Serial.print(value);
-          Serial.println('%');
+          Serial.println("% (send 'a' for auto)");
         } else {
-          Serial.println("[Fans] Enter a duty percent from 0 to 100");
+          Serial.println("[Fans] Enter a duty percent from 0 to 100, or 'a' for auto");
         }
         index = 0;
       }
@@ -717,6 +843,10 @@ void drawDashboard() {
   static uint16_t lastFanDutyColor = ST7735_WHITE;
   static char lastContactor[8] = "";
   static uint16_t lastContactorColor = ST7735_WHITE;
+  static char lastGlv[16] = "";
+  static uint16_t lastGlvColor = ST7735_WHITE;
+  static char lastBusVoltage[16] = "";
+  static uint16_t lastBusVoltageColor = ST7735_WHITE;
 
   bool force = dashboardNeedsFullRedraw;
 
@@ -768,6 +898,10 @@ void drawDashboard() {
     tft.print("FAN:");
     tft.setCursor(335, 222);
     tft.print("CTR:");
+    tft.setCursor(335, 238);
+    tft.print("GLV:");
+    tft.setCursor(335, 254);
+    tft.print("BUS:");
 
     dashboardNeedsFullRedraw = false;
   }
@@ -782,9 +916,21 @@ void drawDashboard() {
   drawCachedDashboardText(102, 125, 64, 18, 2, value, appsPlausible ? ST7735_GREEN : ST7735_RED,
                           lastPedal, sizeof(lastPedal), lastPedalColor, force);
 
-  snprintf(value, sizeof(value), "%.1f", desiredTorqueNm);
-  drawCachedDashboardText(114, 150, 64, 18, 2, value, readyToDriveLatched ? ST7735_GREEN : ST7735_YELLOW,
-                          lastTorque, sizeof(lastTorque), lastTorqueColor, force);
+  // Shows the torque actually loaded into the PM100 command frame; red while
+  // RTD is latched but torque is being suppressed (BSPC latch / APPS fault).
+  {
+    uint16_t torqueColor;
+    if (!readyToDriveLatched) {
+      torqueColor = ST7735_YELLOW;
+    } else if (bspcLatched || !appsPlausible) {
+      torqueColor = ST7735_RED;
+    } else {
+      torqueColor = ST7735_GREEN;
+    }
+    snprintf(value, sizeof(value), "%.1f", commandedTorqueNm);
+    drawCachedDashboardText(114, 150, 64, 18, 2, value, torqueColor,
+                            lastTorque, sizeof(lastTorque), lastTorqueColor, force);
+  }
 
   bool haveInverterPower = haveInverterVoltageInfo && haveInverterCurrentInfo;
   if (haveInverterPower) {
@@ -902,7 +1048,39 @@ void drawDashboard() {
                             lastContactor, sizeof(lastContactor), lastContactorColor, force);
   }
 
-  drawDriveButtons(force);
+  {
+    uint16_t glvColor;
+    if (!haveGlvVoltage) {
+      snprintf(value, sizeof(value), "--");
+      glvColor = ST7735_YELLOW;
+    } else {
+      snprintf(value, sizeof(value), "%.1fV", glvVoltage);
+      glvColor = (glvVoltage < GLV_LOW_VOLTAGE_WARN_V) ? ST7735_RED : ST7735_WHITE;
+    }
+    drawCachedDashboardText(382, 238, 78, 10, 1, value, glvColor,
+                            lastGlv, sizeof(lastGlv), lastGlvColor, force);
+  }
+
+  {
+    uint16_t busColor;
+    if (!haveInverterVoltageInfo) {
+      snprintf(value, sizeof(value), "--");
+      busColor = ST7735_YELLOW;
+    } else {
+      snprintf(value, sizeof(value), "%.1fV", inverterDcBusVoltage);
+      busColor = ST7735_WHITE;
+    }
+    drawCachedDashboardText(382, 254, 78, 10, 1, value, busColor,
+                            lastBusVoltage, sizeof(lastBusVoltage), lastBusVoltageColor, force);
+  }
+
+  drawShutdownStatusIndicators(force);
+
+  if (faultBannerVisible) {
+    drawFaultBanner(force);
+  } else {
+    drawDriveButtons(force);
+  }
 }
 
 void formatCellVoltageText(char *buffer, size_t bufferSize, uint16_t millivolts, bool valid) {
@@ -985,6 +1163,14 @@ void collectDashboardFaults(DashboardFaultList &faults) {
     if (faults.count == beforeCount) {
       appendDashboardFault(faults, "Inv Fault");
     }
+  }
+
+  if (!appsPlausible) {
+    appendDashboardFault(faults, appsFaultText);
+  }
+
+  if (bspcLatched) {
+    appendDashboardFault(faults, "BSPC Latch");
   }
 }
 
@@ -1185,7 +1371,8 @@ void drawDriveButtons(bool force) {
   int startX = 42;
   int gap = 24;
 
-  tft.fillRect(0, y - 8, tft.width(), buttonH + 16, ST7735_BLACK);
+  // Clear only the button band; the cell-stats column at x>=335 shares this row.
+  tft.fillRect(0, y - 8, 320, buttonH + 16, ST7735_BLACK);
 
   const char modes[2] = {'D', 'N'};
   for (int i = 0; i < 2; i++) {
@@ -1221,6 +1408,39 @@ void drawStatusText(int x, int y, const char *label, int value, const char *unit
   drawStatusText(x, y, label, text, valueColor);
 }
 
+// Shutdown-circuit status lights: GPIO HIGH = green, LOW = red.
+void drawShutdownStatusIndicators(bool force) {
+  static int lastBspd = -1;
+  static int lastImd = -1;
+  static int lastBms = -1;
+
+  drawShutdownStatusIndicator(335, 268, "BSPD", digitalRead(BSPD_STATUS_PIN) == HIGH,
+                              lastBspd, force);
+  drawShutdownStatusIndicator(384, 268, "IMD", digitalRead(IMD_STATUS_PIN) == HIGH,
+                              lastImd, force);
+  drawShutdownStatusIndicator(433, 268, "BMS", digitalRead(BMS_STATUS_PIN) == HIGH,
+                              lastBms, force);
+}
+
+void drawShutdownStatusIndicator(int x, int y, const char *label, bool high,
+                                 int &lastState, bool force) {
+  if (!force && (int)high == lastState) {
+    return;
+  }
+  lastState = (int)high;
+
+  const int w = 44;
+  const int h = 18;
+  uint16_t color = high ? ST7735_GREEN : ST7735_RED;
+  tft.fillRoundRect(x, y, w, h, 4, color);
+  tft.setTextSize(1);
+  tft.setTextColor(ST7735_BLACK);
+  int textW = (int)strlen(label) * 6;
+  tft.setCursor(x + (w - textW) / 2, y + 5);
+  tft.print(label);
+  tft.setTextColor(ST7735_WHITE);
+}
+
 // ---------------- CAN transport ----------------
 void setupVehicleCan() {
   VehicleCan.begin();
@@ -1247,6 +1467,12 @@ void receiveCanFrames() {
 }
 
 void dispatchReceivedCanFrame(const CAN_message_t &msg) {
+  if (!havePm100Traffic && msg.id >= PM100_TEMPERATURE_1_FRAME_ID &&
+      msg.id <= PM100_TORQUE_CAPABILITY_FRAME_ID) {
+    havePm100Traffic = true;
+    firstPm100FrameMs = millis();
+  }
+
   switch (msg.id) {
     case IMD_INFO_GENERAL_ID:
     case IMD_RESPONSE_ID:
@@ -1273,8 +1499,16 @@ void dispatchReceivedCanFrame(const CAN_message_t &msg) {
       handlePm100VoltageInfoFrame(msg);
       break;
 
+    case PM100_INTERNAL_VOLTAGES_FRAME_ID:
+      handlePm100InternalVoltagesFrame(msg);
+      break;
+
     case PM100_FAULT_CODES_FRAME_ID:
       handlePm100FaultCodesFrame(msg);
+      break;
+
+    case PM100_PARAM_RESPONSE_ID:
+      handlePm100ParamResponseFrame(msg);
       break;
 
     case BMS_STATUS_2026_ID:
@@ -2008,6 +2242,28 @@ void printPm100VoltageInfoTranslation(const CAN_message_t &msg) {
   Serial.print("V");
 }
 
+void printPm100InternalVoltagesTranslation(const CAN_message_t &msg) {
+  if (msg.len < 8) {
+    Serial.print("short frame, expected 8 bytes");
+    return;
+  }
+
+  int16_t ref1V5Raw = s16Le(msg.buf[0], msg.buf[1]);
+  int16_t ref2V5Raw = s16Le(msg.buf[2], msg.buf[3]);
+  int16_t ref5V0Raw = s16Le(msg.buf[4], msg.buf[5]);
+  int16_t glvRaw = s16Le(msg.buf[6], msg.buf[7]);
+
+  Serial.print("ref1V5=");
+  Serial.print((float)ref1V5Raw / 100.0f, 2);
+  Serial.print("V ref2V5=");
+  Serial.print((float)ref2V5Raw / 100.0f, 2);
+  Serial.print("V ref5V0=");
+  Serial.print((float)ref5V0Raw / 100.0f, 2);
+  Serial.print("V glv12V=");
+  Serial.print((float)glvRaw / 100.0f, 2);
+  Serial.print("V");
+}
+
 void printPm100FaultCodesTranslation(const CAN_message_t &msg) {
   if (msg.len < 8) {
     Serial.print("short frame, expected 8 bytes");
@@ -2409,10 +2665,15 @@ void handleBms2026StatusFrame(const CAN_message_t &msg) {
     Serial.print(flags, HEX);
     Serial.print(" fault=");
     Serial.println(bmsFault ? "YES" : "NO");
+    if (bmsFault) {
+      showFaultBanner((haveBms2026FaultCode && bms2026FaultCode != 0)
+                          ? bmsTemperatureFaultCodeName(bms2026FaultCode)
+                          : "BMS Fault");
+    }
   }
 
   if (anyFaultActive() || contactorsOpen()) {
-    dropReadyToDrive(anyFaultActive() ? "anyFault is active" : "contactors open");
+    dropReadyToDrive(rtdDropCauseText());
   }
 
   screenDirty = true;
@@ -2424,8 +2685,13 @@ void handleBms2026TempFrame(const CAN_message_t &msg) {
   }
 
   // byte 1 = max cell temp encoded as (°C + 40); 0xFF means no valid reading
+  uint8_t previousFaultCode = haveBms2026FaultCode ? bms2026FaultCode : 0;
   bms2026FaultCode = msg.buf[3];
   haveBms2026FaultCode = true;
+  if (bmsImdFaultDetectionArmed() && bms2026FaultCode != 0 &&
+      bms2026FaultCode != previousFaultCode) {
+    showFaultBanner(bmsTemperatureFaultCodeName(bms2026FaultCode));
+  }
 
   haveCellTempStats = (msg.buf[0] != 0xFF && msg.buf[1] != 0xFF && msg.buf[2] != 0xFF);
   if (haveCellTempStats) {
@@ -2482,6 +2748,9 @@ void handleImdFrame(const CAN_message_t &msg) {
     printTssiWarnBits(imdWarnAlarms);
     Serial.print(" => ");
     Serial.println(imdFault ? "FAULT, red blink" : "OK, green on");
+    if (imdFault && !previousFault) {
+      showFaultBanner(firstTssiFaultName(imdWarnAlarms));
+    }
   }
 }
 
@@ -2544,15 +2813,91 @@ void handlePm100VoltageInfoFrame(const CAN_message_t &msg) {
   screenDirty = true;
 }
 
+void handlePm100InternalVoltagesFrame(const CAN_message_t &msg) {
+  if (msg.len < 8) {
+    return;
+  }
+
+  // Bytes 6-7 = 12V System voltage, "Low Voltage" format (volts * 100).
+  glvVoltage = (float)s16Le(msg.buf[6], msg.buf[7]) / 100.0f;
+  haveGlvVoltage = true;
+  screenDirty = true;
+}
+
+void handlePm100ParamResponseFrame(const CAN_message_t &msg) {
+  if (msg.len < 3) {
+    return;
+  }
+
+  uint16_t address = u16Le(msg.buf[0], msg.buf[1]);
+  if (address != PM100_PARAM_CAN_ACTIVE_MSGS) {
+    return;
+  }
+
+  Serial.print("[PM100] CAN Active Messages parameter write ");
+  Serial.println(msg.buf[2] ? "succeeded" : "FAILED");
+}
+
+// The 0x0A9 Internal Voltages broadcast (GLV voltage source) can be disabled
+// in the inverter's EEPROM broadcast mask. If the inverter is alive but 0x0A9
+// stays silent, write parameter 148 to enable all broadcast messages.
+// EEPROM parameters are only writable while the motor is not running.
+void servicePm100BroadcastEnable() {
+  if (haveGlvVoltage || !havePm100Traffic || readyToDriveLatched) {
+    return;
+  }
+
+  if (pm100BroadcastEnableAttempts >= PM100_BROADCAST_ENABLE_MAX_ATTEMPTS) {
+    return;
+  }
+
+  uint32_t now = millis();
+  if (now - firstPm100FrameMs < PM100_BROADCAST_ENABLE_DELAY_MS) {
+    return;
+  }
+
+  if (pm100BroadcastEnableAttempts > 0 &&
+      now - pm100BroadcastEnableLastTxMs < PM100_BROADCAST_ENABLE_RETRY_MS) {
+    return;
+  }
+
+  pm100BroadcastEnableAttempts++;
+  pm100BroadcastEnableLastTxMs = now;
+
+  Serial.print("[PM100] No 0x0A9 Internal Voltages frames; enabling broadcasts, attempt ");
+  Serial.println(pm100BroadcastEnableAttempts);
+  sendPm100BroadcastEnable();
+}
+
+void sendPm100BroadcastEnable() {
+  CAN_message_t tx = {};
+  tx.id = PM100_PARAM_COMMAND_ID;
+  tx.len = 8;
+  tx.flags.extended = 0;
+  tx.buf[0] = (uint8_t)(PM100_PARAM_CAN_ACTIVE_MSGS & 0xFF);
+  tx.buf[1] = (uint8_t)(PM100_PARAM_CAN_ACTIVE_MSGS >> 8);
+  tx.buf[2] = 1;     // write
+  tx.buf[3] = 0;     // reserved
+  tx.buf[4] = 0xFF;  // CAN Active Messages Lo Word: enable all broadcasts
+  tx.buf[5] = 0xFF;
+  tx.buf[6] = 0xFF;  // Hi Word: keep command/BMS/OBD2 mailboxes enabled
+  tx.buf[7] = 0xFF;
+  sendCanFrame(tx);
+}
+
 void handlePm100FaultCodesFrame(const CAN_message_t &msg) {
   if (msg.len < 8) {
     return;
   }
 
+  bool previousFault = havePm100FaultStatus && pm100Fault;
   pm100PostFaults = u32Le(msg.buf[0], msg.buf[1], msg.buf[2], msg.buf[3]);
   pm100RunFaults = u32Le(msg.buf[4], msg.buf[5], msg.buf[6], msg.buf[7]);
   havePm100FaultStatus = true;
   pm100Fault = (pm100PostFaults != 0 || pm100RunFaults != 0);
+  if (pm100Fault && !previousFault) {
+    showFaultBanner(firstPm100FaultName(pm100PostFaults, pm100RunFaults));
+  }
   screenDirty = true;
 }
 
@@ -2575,13 +2920,14 @@ void serviceTssi() {
   if (faultDetectionArmed && now - lastImdRxMs > IMD_HEARTBEAT_TIMEOUT_MS) {
     if (!imdCanTimedOut) {
       Serial.println("[TSSI] IMD heartbeat lost, forcing FAULT");
+      showFaultBanner("IMD Timeout");
     }
     imdCanTimedOut = true;
     imdFault = true;
   }
 
   if ((anyFaultActive() || contactorsOpen()) && readyToDriveLatched) {
-    dropReadyToDrive(anyFaultActive() ? "anyFault is active" : "contactors open");
+    dropReadyToDrive(rtdDropCauseText());
   }
 
   if (now - lastImdGetReqMs >= IMD_GET_REQ_PERIOD_MS) {
@@ -2695,11 +3041,12 @@ void updatePm100CommandState() {
   uint8_t inverterEnable = 0x00;
 
   bool driveSelected = readyToDriveLatched && (driveMode == 'D');
-  bool torqueAllowed = driveSelected && !anyFaultActive() && !contactorsOpen() && appsPlausible && !bspcLatched;
+  // APPS implausibility and a BSPC latch keep the inverter enabled but command
+  // zero torque: updatePedal already forces desiredTorqueNm to 0 for both.
+  bool torqueAllowed = driveSelected && !anyFaultActive() && !contactorsOpen();
 
   if (torqueAllowed) {
-    float torqueNm = desiredTorqueNm;
-    torqueRaw = (int16_t)roundf(torqueNm * (float)TORQUE_SCALE);
+    torqueRaw = (int16_t)roundf(desiredTorqueNm * (float)TORQUE_SCALE);
     direction = pm100DirectionByteForMode(driveMode);
     inverterEnable = 0x01;
   }
@@ -2709,6 +3056,8 @@ void updatePm100CommandState() {
   pm100CommandDirection = direction;
   pm100CommandEnable = inverterEnable;
   interrupts();
+
+  commandedTorqueNm = (float)torqueRaw / (float)TORQUE_SCALE;
 }
 
 void queuePm100TxLogFromIsr(const CAN_message_t &msg) {
@@ -2775,10 +3124,47 @@ void updatePedal() {
     apps2Pct = APPS_EMA_ALPHA * newApps2Pct + (1.0f - APPS_EMA_ALPHA) * apps2Pct;
   }
 
-  float percentError = fabsf(apps1Pct - apps2Pct);
-  appsPlausible = percentError <= APPS_IMPLAUSIBLE_PCT;
+  bool apps1InRange = rawApps1 >= APPS_1_RAW_MIN - APPS_RAW_FAULT_MARGIN &&
+                      rawApps1 <= APPS_1_RAW_MAX + APPS_RAW_FAULT_MARGIN;
+  bool apps2InRange = rawApps2 >= APPS_2_RAW_MIN - APPS_RAW_FAULT_MARGIN &&
+                      rawApps2 <= APPS_2_RAW_MAX + APPS_RAW_FAULT_MARGIN;
 
-  pedalPct = (apps1Pct + apps2Pct) * 0.5f;
+  float percentError = fabsf(apps1Pct - apps2Pct);
+  bool wasPlausible = appsPlausible;
+  bool appsAbnormal = !apps1InRange || !apps2InRange ||
+                      percentError > APPS_IMPLAUSIBLE_PCT;
+
+  if (appsAbnormal) {
+    if (!apps1InRange && !apps2InRange) {
+      appsFaultText = "APPS1+2 Range";
+    } else if (!apps1InRange) {
+      appsFaultText = "APPS1 Range";
+    } else if (!apps2InRange) {
+      appsFaultText = "APPS2 Range";
+    } else {
+      appsFaultText = "APPS Disagree";
+    }
+  }
+
+  if (!appsAbnormal) {
+    appsDisagreeing = false;
+    appsPlausible = true;
+  } else {
+    uint32_t now = millis();
+    if (!appsDisagreeing) {
+      appsDisagreeing = true;
+      appsDisagreeStartMs = now;
+    }
+    if (now - appsDisagreeStartMs > APPS_IMPLAUSIBILITY_PERSIST_MS) {
+      appsPlausible = false;
+    }
+  }
+
+  // BSPC thresholds compare against true pedal travel (pre-deadband) so the
+  // 25% latch and 5% reset points match actual pedal position per EV.4.7.
+  float pedalTravelPct = (apps1Pct + apps2Pct) * 0.5f;
+
+  pedalPct = pedalTravelPct;
   if (pedalPct <= PEDAL_ZERO_DEADBAND_PCT) {
     pedalPct = 0.0f;
   } else {
@@ -2787,21 +3173,40 @@ void updatePedal() {
     pedalPct = (pedalPct - PEDAL_ZERO_DEADBAND_PCT) * 100.0f / (100.0f - PEDAL_ZERO_DEADBAND_PCT);
   }
 
+  // EV.4.7: brake (light-braking threshold) + accelerator >25% latches zero
+  // torque. The latch holds through brake release and only clears once the
+  // accelerator drops below 5% travel.
   bool bspcWasLatched = bspcLatched;
-  if (braking && pedalPct > BSPC_APPS_THRESHOLD_PCT) {
+  if (braking && pedalTravelPct > BSPC_APPS_THRESHOLD_PCT) {
     bspcLatched = true;
-  } else if (pedalPct <= BSPC_APPS_THRESHOLD_PCT) {
+  } else if (bspcLatched && pedalTravelPct < BSPC_APPS_RESET_PCT) {
     bspcLatched = false;
   }
   if (bspcLatched != bspcWasLatched) {
-    Serial.println(bspcLatched ? "[BSPC] Latched; torque inhibited" : "[BSPC] Cleared");
+    Serial.println(bspcLatched ? "[BSPC] Latched; torque inhibited until pedal <5%"
+                               : "[BSPC] Cleared; pedal below reset threshold");
   }
 
   if (appsPlausible) {
     desiredTorqueNm = bspcLatched ? 0.0f : (pedalPct / 100.0f) * MAX_TORQUE_NM;
   } else {
     desiredTorqueNm = 0.0f;
-    dropReadyToDrive("APPS implausible");
+    if (wasPlausible) {
+      Serial.print("[APPS] Implausible (");
+      Serial.print(appsFaultText);
+      Serial.print("): raw1=");
+      Serial.print(rawApps1);
+      Serial.print(" raw2=");
+      Serial.print(rawApps2);
+      Serial.print(" deviation=");
+      Serial.print(percentError, 1);
+      Serial.print("% for >");
+      Serial.print(APPS_IMPLAUSIBILITY_PERSIST_MS);
+      Serial.println(" ms");
+      showFaultBanner(appsFaultText);
+    }
+    // T.4.2.10 only requires zero torque on implausibility; the car stays in
+    // drive and torque returns once the channels agree again.
   }
 }
 
@@ -2829,7 +3234,11 @@ void logAppsTelemetry() {
   Serial.print(pedalPct, 1);
   Serial.print("% torque=");
   Serial.print(desiredTorqueNm, 1);
-  Serial.print("Nm plausible=");
+  Serial.print("Nm cmd=");
+  Serial.print(commandedTorqueNm, 1);
+  Serial.print("Nm bspc=");
+  Serial.print(bspcLatched ? "LATCHED" : "clear");
+  Serial.print(" plausible=");
   Serial.println(appsPlausible ? "YES" : "NO");
 }
 
@@ -2893,7 +3302,9 @@ bool rtdInputsReady() {
     return false;
   }
 
-  return !anyFaultActive() && !contactorsOpen() && appsPlausible;
+  // APPS implausibility intentionally does not gate RTD; it zeroes the torque
+  // command instead (see updatePedal/updatePm100CommandState).
+  return !anyFaultActive() && !contactorsOpen();
 }
 
 bool readyForRtdButton() {
@@ -2903,7 +3314,7 @@ bool readyForRtdButton() {
 void refreshRtdStateFromInputs() {
   if (rtdState == RTD_STATE_READY_TO_DRIVE) {
     if (!rtdInputsReady()) {
-      dropReadyToDrive(anyFaultActive() ? "anyFault is active" : "contactors open");
+      dropReadyToDrive(rtdDropCauseText());
     }
     return;
   }
@@ -2936,7 +3347,6 @@ void logRtdBlockedReason() {
   if (imdFault)            Serial.print(" imdFault");
   if (bmsFault)            Serial.print(" bmsFault");
   if (contactorsOpen())    Serial.print(" contactorsOpen");
-  if (!appsPlausible)      Serial.print(" appsImplausible");
   if (imdCanTimedOut)      Serial.print(" imdCanTimedOut");
   if (bmsTimedOut)         Serial.print(" bmsTimedOut");
   Serial.print(" bmsFlags=0x");
@@ -3000,7 +3410,75 @@ void dropReadyToDrive(const char *reason) {
   if (wasLatched && reason != nullptr) {
     Serial.print("[RTD] Dropped; ");
     Serial.println(reason);
+    if (strcmp(reason, "RTD button pressed") != 0) {
+      showFaultBanner(reason);
+    }
   }
+}
+
+// Names the specific condition currently blocking RTD, for serial logs and
+// the dashboard fault banner.
+const char *rtdDropCauseText() {
+  if (bmsTimedOut && haveBmsStatus) return "BMS Timeout";
+  if (imdCanTimedOut) return "IMD Timeout";
+  if (bmsFault) {
+    return (haveBms2026FaultCode && bms2026FaultCode != 0)
+               ? bmsTemperatureFaultCodeName(bms2026FaultCode)
+               : "BMS Fault";
+  }
+  if (imdFault) return firstTssiFaultName(imdWarnAlarms);
+  if (contactorsOpen()) return "Contactors Open";
+  return "Fault";
+}
+
+void showFaultBanner(const char *text) {
+  if (text == nullptr || text[0] == '\0') {
+    return;
+  }
+
+  if (!faultBannerVisible || strcmp(text, faultBannerText) != 0) {
+    strncpy(faultBannerText, text, sizeof(faultBannerText) - 1);
+    faultBannerText[sizeof(faultBannerText) - 1] = '\0';
+    faultBannerDirty = true;
+  }
+  faultBannerVisible = true;
+  faultBannerUntilMs = millis() + FAULT_BANNER_DURATION_MS;
+  screenDirty = true;
+}
+
+void serviceFaultBanner() {
+  if (!faultBannerVisible) {
+    return;
+  }
+
+  if ((int32_t)(millis() - faultBannerUntilMs) >= 0) {
+    faultBannerVisible = false;
+    faultBannerText[0] = '\0';
+    dashboardNeedsFullRedraw = true;
+    screenDirty = true;
+  }
+}
+
+// Draws the fault banner over the drive-button row; the row is repainted via
+// a full redraw when the banner expires.
+void drawFaultBanner(bool force) {
+  if (!force && !faultBannerDirty) {
+    return;
+  }
+  faultBannerDirty = false;
+
+  int y = (int)(tft.height() * 0.72f) - 8;
+  int h = 54 + 16;
+
+  tft.fillRect(0, y, tft.width(), h, ST7735_RED);
+  tft.setTextSize(2);
+  tft.setTextColor(ST7735_WHITE);
+  tft.setCursor(12, y + 8);
+  tft.print("FAULT");
+  tft.setTextSize(3);
+  tft.setCursor(12, y + 32);
+  tft.print(faultBannerText);
+  tft.setTextColor(ST7735_WHITE);
 }
 
 const char *rtdStateName(RtdState state) {
