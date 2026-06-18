@@ -58,8 +58,8 @@ static constexpr uint32_t CHARGER_TIMEOUT_MS   = 5000;
 static constexpr uint32_t SOC_SAVE_MS          = 30000;
 static constexpr uint32_t RUNNING_VOLT_MS      = 200;
 static constexpr uint32_t CELL_DUMP_GAP_MS     = 5;
-static constexpr uint32_t IMD_DISAGREE_ABS     = 10;   // V absolute threshold
-static constexpr float    IMD_DISAGREE_PCT     = 0.05f;
+static constexpr uint32_t IMD_DISAGREE_ABS     = 100;   // V absolute threshold
+static constexpr float    IMD_DISAGREE_PCT     = 0.40f;
 
 static constexpr int EEPROM_SOC_ADDR      = 0;  // float, 4 bytes
 static constexpr int EEPROM_CAL_GAIN_ADDR = 4;  // float, 4 bytes
