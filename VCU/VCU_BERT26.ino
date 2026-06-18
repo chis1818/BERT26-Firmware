@@ -439,6 +439,9 @@ bool imdCanTimedOut = true;
 
 uint32_t tssiBlinkTimerMs = 0;
 bool tssiRedOn = false;
+// Once the TSSI has blinked red for any fault it stays latched in the red-blink
+// state until the board is power-cycled (this flag clears on reset).
+bool tssiFaultLatched = false;
 uint32_t lastImdGetReqMs = 0;
 
 RtdState rtdState = RTD_STATE_FAULT_BLOCKED;
@@ -3608,7 +3611,15 @@ void serviceTssi() {
     requestImdWarnings();
   }
 
-  if (!faultDetectionArmed) {
+  // Latch the red blink the first time a fault is seen; once latched the TSSI
+  // stays red until power cycle, even if the underlying fault clears.
+  if (faultDetectionArmed && anyFaultActive()) {
+    tssiFaultLatched = true;
+  }
+
+  if (tssiFaultLatched) {
+    updateTssiLed(true, now);
+  } else if (!faultDetectionArmed) {
     setTssiGreenOn();
   } else {
     updateTssiLed(anyFaultActive(), now);
