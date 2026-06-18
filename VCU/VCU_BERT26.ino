@@ -1,9 +1,11 @@
 #include <Arduino.h>
 #include <FlexCAN_T4.h>
 #include <SPI.h>
+#include <Wire.h>
 #include <IntervalTimer.h>
 #include <ST7796_t3.h>
 #include <XPT2046_Touchscreen.h>
+#include <SD.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +19,8 @@
     - Plays a different buzzer pattern when the RTD button on GPIO 23 is pressed.
     - Reads the dual analog accelerator pedal sensor.
     - Sends Cascadia PM100DX torque commands at 100 Hz over CAN.
+    - Logs binary telemetry sessions (LOGnnnn.BIN) to the built-in SD card;
+      decode to CSV on a PC with tools/decode_vcu_log.py.
 */
 
 // ---------------- Display / touch pins ----------------
@@ -45,6 +49,32 @@ static const int FAN_2_PIN        = 2;
 static const int BSPD_STATUS_PIN  = 24;
 static const int IMD_STATUS_PIN   = 25;
 static const int BMS_STATUS_PIN   = 28;
+
+// HV battery current sensor analog input; sampled into the fast data log.
+static const int HV_CURRENT_SENSE_PIN = 14;
+
+// MPU6050 IMU on the default Wire pins (18=SDA, 19=SCL). The sensor's INT pin
+// is wired to 33 and configured as data-ready, but samples are polled at the
+// fast-log rate so the interrupt is informational only.
+static const int IMU_INT_PIN = 33;
+static constexpr uint8_t MPU6050_I2C_ADDR = 0x68;
+static constexpr uint32_t IMU_I2C_CLOCK_HZ = 400000;
+static constexpr uint8_t MPU6050_REG_SMPLRT_DIV   = 0x19;
+static constexpr uint8_t MPU6050_REG_CONFIG       = 0x1A;
+static constexpr uint8_t MPU6050_REG_GYRO_CONFIG  = 0x1B;
+static constexpr uint8_t MPU6050_REG_ACCEL_CONFIG = 0x1C;
+static constexpr uint8_t MPU6050_REG_INT_PIN_CFG  = 0x37;
+static constexpr uint8_t MPU6050_REG_INT_ENABLE   = 0x38;
+static constexpr uint8_t MPU6050_REG_ACCEL_XOUT_H = 0x3B;
+static constexpr uint8_t MPU6050_REG_PWR_MGMT_1   = 0x6B;
+static constexpr uint8_t MPU6050_REG_WHO_AM_I     = 0x75;
+static constexpr uint8_t MPU6050_WHO_AM_I_VALUE   = 0x68;
+// ±4 g accel (8192 LSB/g) and ±500 dps gyro (65.5 LSB/dps); raw counts are
+// logged and scaled to g / deg/s in the decoder.
+static constexpr uint8_t MPU6050_ACCEL_FS_4G      = 0x08;
+static constexpr uint8_t MPU6050_GYRO_FS_500DPS   = 0x08;
+static constexpr uint8_t MPU6050_DLPF_44HZ        = 0x03;
+static constexpr uint32_t IMU_RETRY_PERIOD_MS = 5000;
 
 static constexpr uint32_t FAN_PWM_FREQUENCY_HZ = 20000;
 static constexpr uint8_t FAN_PWM_WRITE_MAX = 255;
@@ -81,8 +111,11 @@ static const uint32_t APPS_IMPLAUSIBILITY_PERSIST_MS = 100;
 // sensor fault (short/open), not pedal travel.
 static const int APPS_RAW_FAULT_MARGIN = 150;
 static const float PEDAL_ZERO_DEADBAND_PCT = 7.0f;
-static const float MAX_TORQUE_NM           = 120.0f;
+static const float MAX_TORQUE_NM           = 210.0f;
 static const float BSPC_APPS_THRESHOLD_PCT = 25.0f;
+// Per EV.4.7/T.4.7 the BSPC latch only releases once the accelerator returns
+// below 5% travel; releasing the brake alone must NOT restore torque.
+static const float BSPC_APPS_RESET_PCT     = 5.0f;
 
 // Calculated from voltage divider at input. R1 = 5.6k, R2 = 15k, Gain = 0.728
 // This comment was written by a human, me
@@ -127,6 +160,16 @@ static constexpr uint16_t PM100_PARAM_CAN_ACTIVE_MSGS = 148;
 static constexpr uint32_t PM100_BROADCAST_ENABLE_DELAY_MS = 5000;
 static constexpr uint32_t PM100_BROADCAST_ENABLE_RETRY_MS = 5000;
 static constexpr uint8_t PM100_BROADCAST_ENABLE_MAX_ATTEMPTS = 3;
+// Parameter 20 = "Fault Clear"; writing 0 tells the inverter to clear latched
+// fault codes. Sent automatically when the inverter is faulted but the BMS
+// reports contactors closed and the DC bus is back at pack voltage, so a
+// transient fault (e.g. under-voltage from an HV cycle or pack sag) doesn't
+// require power-cycling the inverter. 240 V = 96 series cells at the 2.5 V
+// minimum, so any bus above that means the pack is genuinely back on the bus.
+static constexpr uint16_t PM100_PARAM_FAULT_CLEAR = 20;
+static constexpr float PM100_FAULT_CLEAR_MIN_BUS_V = 240.0f;
+static constexpr uint32_t PM100_FAULT_CLEAR_RETRY_MS = 2000;
+static constexpr uint8_t PM100_FAULT_CLEAR_MAX_ATTEMPTS = 3;
 static constexpr uint16_t TORQUE_SCALE       = 10;      // 0.1 Nm per LSB
 static constexpr uint32_t CMD_PERIOD_MS      = 10;      // 100 Hz
 static constexpr uint32_t PM100_CMD_PERIOD_US = CMD_PERIOD_MS * 1000u;
@@ -185,6 +228,99 @@ enum RtdState {
   RTD_STATE_READY_TO_DRIVE
 };
 
+// ---------------- Data logging ----------------
+// Binary session logs. A new LOGnnnn.BIN is created on the built-in SD card
+// at every power-up, holding fast (10 ms), medium (100 ms), slow (1 s) and
+// IMU (10 ms) records. Files are decoded to CSV on a computer with
+// tools/decode_vcu_log.py; nothing is converted on the VCU.
+static constexpr uint32_t LOG_FAST_PERIOD_MS   = 10;
+static constexpr uint32_t LOG_MEDIUM_PERIOD_MS = 100;
+static constexpr uint32_t LOG_SLOW_PERIOD_MS   = 1000;
+static constexpr uint32_t LOG_SD_FLUSH_PERIOD_MS = 1000;
+static constexpr uint8_t LOG_RECORD_FAST   = 0x01;
+static constexpr uint8_t LOG_RECORD_MEDIUM = 0x02;
+static constexpr uint8_t LOG_RECORD_SLOW   = 0x03;
+static constexpr uint8_t LOG_RECORD_IMU    = 0x04;
+static constexpr char LOG_FILE_MAGIC[8] = {'V','C','U','L','O','G','0','1'};
+
+struct __attribute__((packed)) LogFileHeader {
+  char magic[8];
+  uint32_t session;
+  uint8_t fastSize;
+  uint8_t mediumSize;
+  uint8_t slowSize;
+  uint8_t imuSize;          // 0 in logs from firmware without an IMU
+};
+
+// 25 bytes @ 100 Hz. Raw ADC counts are logged (not scaled floats) so pedal
+// faults can be reconstructed exactly; scaling happens in the decoder.
+struct __attribute__((packed)) LogFastRecord {
+  uint8_t type;
+  uint32_t ms;
+  uint16_t rawApps1;
+  uint16_t rawApps2;
+  uint16_t rawBse1;
+  uint16_t rawBse2;
+  uint16_t rawHvCurrent;
+  int16_t commandedTorqueDeciNm;
+  int16_t motorRpm;
+  int16_t busVoltageDeciV;
+  int16_t busCurrentDeciA;
+  uint16_t statusFlags;     // see logStatusFlags()
+};
+
+// 39 bytes @ 10 Hz.
+struct __attribute__((packed)) LogMediumRecord {
+  uint8_t type;
+  uint32_t ms;
+  int16_t apps1PctX10;
+  int16_t apps2PctX10;
+  int16_t pedalPctX10;
+  int16_t desiredTorqueDeciNm;
+  int16_t powerDeciKw;
+  int16_t speedMph;
+  uint16_t glvCentiV;
+  int16_t inverterTempTenthsC;
+  int16_t motorTempTenthsC;
+  uint8_t socPct;
+  uint8_t batteryTempC;
+  uint8_t bmsFlags;
+  uint8_t bms2026FaultCode;
+  uint16_t imdWarnAlarms;
+  uint32_t pm100PostFaults;
+  uint32_t pm100RunFaults;
+  uint8_t fanDutyPct;
+  uint8_t rtdState;
+};
+
+// 21 bytes @ 1 Hz.
+struct __attribute__((packed)) LogSlowRecord {
+  uint8_t type;
+  uint32_t ms;
+  uint16_t minCellMv;
+  uint16_t maxCellMv;
+  uint16_t avgCellMv;
+  int16_t minCellTempC;
+  int16_t maxCellTempC;
+  int16_t avgCellTempC;
+  uint16_t imdRIsoKohm;
+  uint8_t imdRIsoStatus;
+  uint8_t validFlags;       // bit0 cell V stats, bit1 cell T stats, bit2 GLV
+};
+
+// 19 bytes @ 100 Hz. Raw MPU6050 counts; the decoder scales to g and deg/s.
+struct __attribute__((packed)) LogImuRecord {
+  uint8_t type;
+  uint32_t ms;
+  int16_t accelX;
+  int16_t accelY;
+  int16_t accelZ;
+  int16_t gyroX;
+  int16_t gyroY;
+  int16_t gyroZ;
+  int16_t tempRaw;          // degC = raw / 340 + 36.53
+};
+
 // ---------------- Runtime state ----------------
 char driveMode = 'N';  // RTD state machine sets D only while ready to drive.
 
@@ -215,6 +351,24 @@ float bse1Pct = 0.0f;
 float bse2Pct = 0.0f;
 bool braking = false;
 bool hardBraking = false;
+int rawHvCurrentLast = 0;
+
+// IMU state; imuPresent reflects the last init/read outcome so a loose
+// connector shows up as missing records, never as stale repeated data.
+bool imuPresent = false;
+uint32_t imuLastInitAttemptMs = 0;
+int16_t imuAccelRaw[3] = {0, 0, 0};
+int16_t imuGyroRaw[3] = {0, 0, 0};
+int16_t imuTempRaw = 0;
+
+// Data logging state. Records are staged in RAM and written in 512-byte
+// chunks so the loop only pays for an SD write every couple hundred ms.
+File sdLogFile;
+bool sdCardStarted = false;
+bool sdLogActive = false;
+uint32_t logSessionNumber = 0;
+uint8_t sdLogBuffer[512];
+size_t sdLogBufferLen = 0;
 
 // Duty cycles are set automatically from motor/inverter temps unless a
 // manual override is entered over serial (digits = override, 'a' = auto).
@@ -258,6 +412,10 @@ uint32_t pm100PostFaults = 0;
 uint32_t pm100RunFaults = 0;
 bool havePm100FaultStatus = false;
 bool pm100Fault = false;
+// Automatic fault-clear bookkeeping; attempts reset when the fault clears or
+// the contactors open, so each HV cycle gets a fresh set of retries.
+uint8_t pm100FaultClearAttempts = 0;
+uint32_t pm100FaultClearLastTxMs = 0;
 int16_t motorRpm = 0;
 int speedMph = 0;
 
@@ -325,10 +483,15 @@ static const ToneStep TS_READY_CHIME_PATTERN[] = {
   {1319, 300, 1500}
 };
 
+// EV.10.2: ready-to-drive sound, 1-3 seconds. Solid continuous tone for the
+// first 1.25 s (satisfies the >=1 s continuous requirement), then a short
+// playful flourish. Step on+off times sum to 2000 ms total.
 static const ToneStep RTD_PATTERN[] = {
-  {2400, 90, 80},
-  {2400, 90, 80},
-  {2400, 90, 0}
+  {2093, 1250,  0},  // C7 - continuous main sound (1.25 s)
+  {2637,  120, 40},  // E7
+  {3136,  120, 40},  // G7
+  {2637,  120, 40},  // E7
+  {3136,  270,  0}   // G7 - final flourish
 };
 
 const ToneStep *activeTonePattern = nullptr;
@@ -354,7 +517,27 @@ struct DashboardFaultList {
 // ---------------- Function declarations ----------------
 void setupDisplay();
 void resetDisplay();
-void handleSerialFanDutyInput();
+void handleSerialConsoleInput();
+void handleSerialConsoleCommand(const char *cmd);
+
+void setupDataLogging();
+void serviceDataLogging();
+void writeFastLogRecord(uint32_t nowMs);
+void writeMediumLogRecord(uint32_t nowMs);
+void writeSlowLogRecord(uint32_t nowMs);
+void writeImuLogRecord(uint32_t nowMs);
+void setupImu();
+bool initImu();
+bool readImuSample();
+bool writeImuRegister(uint8_t reg, uint8_t value);
+uint16_t logStatusFlags();
+void appendSdLog(const void *data, size_t len);
+void flushSdLogBuffer();
+uint32_t nextLogSessionNumber();
+uint32_t maxLogSessionInDir(File dir);
+void listLogFiles();
+void listLogDir(File dir);
+void dumpLogFile(uint32_t session);
 void handleTouch();
 char checkIfTouchedRaw(int x, int y);
 void drawDashboard();
@@ -460,6 +643,8 @@ void handlePm100FaultCodesFrame(const CAN_message_t &msg);
 void handlePm100ParamResponseFrame(const CAN_message_t &msg);
 void servicePm100BroadcastEnable();
 void sendPm100BroadcastEnable();
+void servicePm100FaultClear();
+void sendPm100FaultClear();
 void setupTssi();
 void serviceTssi();
 void requestImdWarnings();
@@ -562,6 +747,7 @@ void setup() {
   pinMode(APPS_2_PIN, INPUT);
   pinMode(BSE_1_PIN, INPUT);
   pinMode(BSE_2_PIN, INPUT);
+  pinMode(HV_CURRENT_SENSE_PIN, INPUT);
 
   pinMode(BRAKE_LIGHT_PIN, OUTPUT);
   digitalWrite(BRAKE_LIGHT_PIN, LOW);
@@ -582,6 +768,10 @@ void setup() {
   Serial.print(STARTUP_BMS_IMD_FAULT_DELAY_MS);
   Serial.println(" ms");
 
+  setupImu();
+
+  setupDataLogging();
+
   setupDisplay();
 
   drawDashboard();
@@ -589,7 +779,7 @@ void setup() {
 
 // ---------------- Main loop ----------------
 void loop() {
-  handleSerialFanDutyInput();
+  handleSerialConsoleInput();
   updateFanDutyFromTemps();
   serviceFans();
   receiveCanFrames();
@@ -625,6 +815,8 @@ void loop() {
   updatePm100CommandState();
   servicePm100TxLogging();
   servicePm100BroadcastEnable();
+  servicePm100FaultClear();
+  serviceDataLogging();
 
   static uint32_t lastDrawMs = 0;
   if (screenDirty || now - lastDrawMs >= SCREEN_PERIOD_MS) {
@@ -699,6 +891,397 @@ uint8_t dutyPercentToFanPwmWrite(int dutyPercent) {
   return (uint8_t)((duty * FAN_PWM_WRITE_MAX + 50) / 100);
 }
 
+// ---------------- Data logging ----------------
+void setupDataLogging() {
+  sdCardStarted = SD.begin(BUILTIN_SDCARD);
+  if (!sdCardStarted) {
+    Serial.println("[Log] No SD card found; data logging disabled");
+    return;
+  }
+
+  logSessionNumber = nextLogSessionNumber();
+
+  char name[16];
+  snprintf(name, sizeof(name), "LOG%04lu.BIN", (unsigned long)logSessionNumber);
+
+  LogFileHeader header;
+  memcpy(header.magic, LOG_FILE_MAGIC, sizeof(header.magic));
+  header.session = logSessionNumber;
+  header.fastSize = sizeof(LogFastRecord);
+  header.mediumSize = sizeof(LogMediumRecord);
+  header.slowSize = sizeof(LogSlowRecord);
+  header.imuSize = sizeof(LogImuRecord);
+
+  sdLogFile = SD.open(name, FILE_WRITE);
+  if (sdLogFile) {
+    sdLogFile.write(&header, sizeof(header));
+    sdLogFile.flush();
+    sdLogActive = true;
+    Serial.print("[Log] Logging to ");
+    Serial.println(name);
+  } else {
+    Serial.print("[Log] Failed to create ");
+    Serial.println(name);
+  }
+}
+
+// One file per power cycle: next session = highest existing LOGnnnn.BIN + 1.
+uint32_t nextLogSessionNumber() {
+  uint32_t maxSession = 0;
+
+  File root = SD.open("/");
+  if (root) {
+    maxSession = maxLogSessionInDir(root);
+    root.close();
+  }
+
+  return maxSession + 1;
+}
+
+uint32_t maxLogSessionInDir(File dir) {
+  uint32_t maxSession = 0;
+
+  for (File entry = dir.openNextFile(); entry; entry = dir.openNextFile()) {
+    unsigned int session = 0;
+    if (sscanf(entry.name(), "LOG%u.BIN", &session) == 1 &&
+        (uint32_t)session > maxSession) {
+      maxSession = session;
+    }
+    entry.close();
+  }
+
+  return maxSession;
+}
+
+void serviceDataLogging() {
+  if (!sdLogActive) {
+    return;
+  }
+
+  static uint32_t lastFastMs = 0;
+  static uint32_t lastMediumMs = 0;
+  static uint32_t lastSlowMs = 0;
+  static uint32_t lastSdFlushMs = 0;
+
+  uint32_t now = millis();
+
+  if (now - lastFastMs >= LOG_FAST_PERIOD_MS) {
+    lastFastMs = now;
+    writeFastLogRecord(now);
+    writeImuLogRecord(now);
+  }
+
+  if (now - lastMediumMs >= LOG_MEDIUM_PERIOD_MS) {
+    lastMediumMs = now;
+    writeMediumLogRecord(now);
+  }
+
+  if (now - lastSlowMs >= LOG_SLOW_PERIOD_MS) {
+    lastSlowMs = now;
+    writeSlowLogRecord(now);
+  }
+
+  // Periodic flush bounds data loss at power-off to about one second.
+  if (sdLogActive && now - lastSdFlushMs >= LOG_SD_FLUSH_PERIOD_MS) {
+    lastSdFlushMs = now;
+    flushSdLogBuffer();
+    if (sdLogActive) {
+      sdLogFile.flush();
+    }
+  }
+}
+
+uint16_t logStatusFlags() {
+  uint16_t flags = 0;
+  if (braking)                              flags |= 1u << 0;
+  if (hardBraking)                          flags |= 1u << 1;
+  if (bspcActive)                           flags |= 1u << 2;
+  if (appsPlausible)                        flags |= 1u << 3;
+  if (readyToDriveLatched)                  flags |= 1u << 4;
+  if (driveMode == 'D')                     flags |= 1u << 5;
+  if (bmsFault)                             flags |= 1u << 6;
+  if (imdFault)                             flags |= 1u << 7;
+  if (pm100Fault)                           flags |= 1u << 8;
+  if (bmsTimedOut)                          flags |= 1u << 9;
+  if (imdCanTimedOut)                       flags |= 1u << 10;
+  if (!contactorsOpen())                    flags |= 1u << 11;
+  if (digitalRead(BSPD_STATUS_PIN) == HIGH) flags |= 1u << 12;
+  if (digitalRead(IMD_STATUS_PIN) == HIGH)  flags |= 1u << 13;
+  if (digitalRead(BMS_STATUS_PIN) == HIGH)  flags |= 1u << 14;
+  return flags;
+}
+
+void writeFastLogRecord(uint32_t nowMs) {
+  rawHvCurrentLast = analogRead(HV_CURRENT_SENSE_PIN);
+
+  LogFastRecord r;
+  r.type = LOG_RECORD_FAST;
+  r.ms = nowMs;
+  r.rawApps1 = (uint16_t)rawApps1Last;
+  r.rawApps2 = (uint16_t)rawApps2Last;
+  r.rawBse1 = (uint16_t)rawBse1Last;
+  r.rawBse2 = (uint16_t)rawBse2Last;
+  r.rawHvCurrent = (uint16_t)rawHvCurrentLast;
+  r.commandedTorqueDeciNm = (int16_t)roundf(commandedTorqueNm * 10.0f);
+  r.motorRpm = motorRpm;
+  r.busVoltageDeciV = (int16_t)roundf(inverterDcBusVoltage * 10.0f);
+  r.busCurrentDeciA = (int16_t)roundf(inverterDcBusCurrent * 10.0f);
+  r.statusFlags = logStatusFlags();
+
+  appendSdLog(&r, sizeof(r));
+}
+
+void writeMediumLogRecord(uint32_t nowMs) {
+  LogMediumRecord r;
+  r.type = LOG_RECORD_MEDIUM;
+  r.ms = nowMs;
+  r.apps1PctX10 = (int16_t)roundf(apps1Pct * 10.0f);
+  r.apps2PctX10 = (int16_t)roundf(apps2Pct * 10.0f);
+  r.pedalPctX10 = (int16_t)roundf(pedalPct * 10.0f);
+  r.desiredTorqueDeciNm = (int16_t)roundf(desiredTorqueNm * 10.0f);
+  r.powerDeciKw = (int16_t)roundf(powerKw * 10.0f);
+  r.speedMph = (int16_t)speedMph;
+  r.glvCentiV = haveGlvVoltage ? (uint16_t)roundf(glvVoltage * 100.0f) : 0;
+  r.inverterTempTenthsC = inverterTempTenthsC;
+  r.motorTempTenthsC = pm100MotorTempTenthsC;
+  r.socPct = stateOfChargePct;
+  r.batteryTempC = batteryTempC;
+  r.bmsFlags = bmsFlags;
+  r.bms2026FaultCode = haveBms2026FaultCode ? bms2026FaultCode : 0;
+  r.imdWarnAlarms = imdWarnAlarms;
+  r.pm100PostFaults = pm100PostFaults;
+  r.pm100RunFaults = pm100RunFaults;
+  r.fanDutyPct = (uint8_t)constrain(fan1DutyPercent, 0, 100);
+  r.rtdState = (uint8_t)rtdState;
+
+  appendSdLog(&r, sizeof(r));
+}
+
+void writeSlowLogRecord(uint32_t nowMs) {
+  LogSlowRecord r;
+  r.type = LOG_RECORD_SLOW;
+  r.ms = nowMs;
+  r.minCellMv = minCellVoltageMv;
+  r.maxCellMv = maxCellVoltageMv;
+  r.avgCellMv = avgCellVoltageMv;
+  r.minCellTempC = minCellTempC;
+  r.maxCellTempC = maxCellTempC;
+  r.avgCellTempC = avgCellTempC;
+  r.imdRIsoKohm = imdRIsoKohm;
+  r.imdRIsoStatus = imdRIsoStatus;
+  r.validFlags = (haveCellVoltageStats ? 0x01 : 0) |
+                 (haveCellTempStats ? 0x02 : 0) |
+                 (haveGlvVoltage ? 0x04 : 0);
+
+  appendSdLog(&r, sizeof(r));
+}
+
+// ---------------- IMU (MPU6050) ----------------
+void setupImu() {
+  Wire.begin();
+  Wire.setClock(IMU_I2C_CLOCK_HZ);
+  pinMode(IMU_INT_PIN, INPUT);
+
+  imuPresent = initImu();
+  imuLastInitAttemptMs = millis();
+  Serial.println(imuPresent
+                     ? "[IMU] MPU6050 detected; logging accel/gyro at 100 Hz"
+                     : "[IMU] MPU6050 not responding; IMU records disabled");
+}
+
+bool initImu() {
+  Wire.beginTransmission(MPU6050_I2C_ADDR);
+  Wire.write(MPU6050_REG_WHO_AM_I);
+  if (Wire.endTransmission(false) != 0 ||
+      Wire.requestFrom((int)MPU6050_I2C_ADDR, 1) != 1) {
+    return false;
+  }
+  uint8_t whoAmI = Wire.read();
+  if (whoAmI != MPU6050_WHO_AM_I_VALUE) {
+    Serial.print("[IMU] Unexpected WHO_AM_I 0x");
+    printCanHexByte(whoAmI);
+    Serial.println();
+    return false;
+  }
+
+  // Wake from sleep with the gyro X PLL as clock, then 1 kHz sampling behind
+  // the 44/42 Hz DLPF so every 100 Hz log read sees fresh, filtered data.
+  return writeImuRegister(MPU6050_REG_PWR_MGMT_1, 0x01) &&
+         writeImuRegister(MPU6050_REG_SMPLRT_DIV, 0) &&
+         writeImuRegister(MPU6050_REG_CONFIG, MPU6050_DLPF_44HZ) &&
+         writeImuRegister(MPU6050_REG_GYRO_CONFIG, MPU6050_GYRO_FS_500DPS) &&
+         writeImuRegister(MPU6050_REG_ACCEL_CONFIG, MPU6050_ACCEL_FS_4G) &&
+         writeImuRegister(MPU6050_REG_INT_PIN_CFG, 0x10) &&  // clear INT on any read
+         writeImuRegister(MPU6050_REG_INT_ENABLE, 0x01);     // data-ready out on pin 33
+}
+
+bool writeImuRegister(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(MPU6050_I2C_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+// Burst-reads accel, temp and gyro (registers 0x3B-0x48, big-endian pairs).
+bool readImuSample() {
+  Wire.beginTransmission(MPU6050_I2C_ADDR);
+  Wire.write(MPU6050_REG_ACCEL_XOUT_H);
+  if (Wire.endTransmission(false) != 0 ||
+      Wire.requestFrom((int)MPU6050_I2C_ADDR, 14) != 14) {
+    return false;
+  }
+
+  uint8_t buf[14];
+  for (uint8_t i = 0; i < sizeof(buf); i++) {
+    buf[i] = (uint8_t)Wire.read();
+  }
+
+  for (uint8_t axis = 0; axis < 3; axis++) {
+    imuAccelRaw[axis] = (int16_t)u16Be(buf[axis * 2], buf[axis * 2 + 1]);
+    imuGyroRaw[axis] = (int16_t)u16Be(buf[8 + axis * 2], buf[9 + axis * 2]);
+  }
+  imuTempRaw = (int16_t)u16Be(buf[6], buf[7]);
+  return true;
+}
+
+void writeImuLogRecord(uint32_t nowMs) {
+  if (!imuPresent) {
+    // Retry init occasionally so a sensor that comes back mid-session
+    // (loose connector, late power) resumes logging without a reboot.
+    if (nowMs - imuLastInitAttemptMs >= IMU_RETRY_PERIOD_MS) {
+      imuLastInitAttemptMs = nowMs;
+      imuPresent = initImu();
+      if (imuPresent) {
+        Serial.println("[IMU] MPU6050 detected; logging accel/gyro at 100 Hz");
+      }
+    }
+    if (!imuPresent) {
+      return;
+    }
+  }
+
+  if (!readImuSample()) {
+    Serial.println("[IMU] Read failed; will retry init");
+    imuPresent = false;
+    imuLastInitAttemptMs = nowMs;
+    return;
+  }
+
+  LogImuRecord r;
+  r.type = LOG_RECORD_IMU;
+  r.ms = nowMs;
+  r.accelX = imuAccelRaw[0];
+  r.accelY = imuAccelRaw[1];
+  r.accelZ = imuAccelRaw[2];
+  r.gyroX = imuGyroRaw[0];
+  r.gyroY = imuGyroRaw[1];
+  r.gyroZ = imuGyroRaw[2];
+  r.tempRaw = imuTempRaw;
+
+  appendSdLog(&r, sizeof(r));
+}
+
+void appendSdLog(const void *data, size_t len) {
+  if (!sdLogActive) {
+    return;
+  }
+
+  if (sdLogBufferLen + len > sizeof(sdLogBuffer)) {
+    flushSdLogBuffer();
+    if (!sdLogActive) {
+      return;
+    }
+  }
+
+  memcpy(sdLogBuffer + sdLogBufferLen, data, len);
+  sdLogBufferLen += len;
+}
+
+void flushSdLogBuffer() {
+  if (!sdLogActive || sdLogBufferLen == 0) {
+    sdLogBufferLen = 0;
+    return;
+  }
+
+  size_t written = sdLogFile.write(sdLogBuffer, sdLogBufferLen);
+  if (written != sdLogBufferLen) {
+    Serial.println("[Log] SD write failed; SD logging stopped");
+    sdLogFile.close();
+    sdLogActive = false;
+  }
+  sdLogBufferLen = 0;
+}
+
+void listLogFiles() {
+  if (!sdCardStarted) {
+    Serial.println("[Log] SD card not available");
+    return;
+  }
+
+  Serial.println("[Log] SD card:");
+  File root = SD.open("/");
+  if (root) {
+    listLogDir(root);
+    root.close();
+  }
+}
+
+void listLogDir(File dir) {
+  for (File entry = dir.openNextFile(); entry; entry = dir.openNextFile()) {
+    if (!entry.isDirectory()) {
+      Serial.print("  ");
+      Serial.print(entry.name());
+      Serial.print("  ");
+      Serial.print((unsigned long)entry.size());
+      Serial.println(" bytes");
+    }
+    entry.close();
+  }
+}
+
+// Hex-dumps a session file over serial so logs can be exported without
+// pulling the SD card; decode with tools/decode_vcu_log.py --hex.
+void dumpLogFile(uint32_t session) {
+  if (!sdCardStarted) {
+    Serial.println("[Log] SD card not available");
+    return;
+  }
+
+  char name[16];
+  snprintf(name, sizeof(name), "LOG%04lu.BIN", (unsigned long)session);
+
+  // Make sure everything buffered for the current session is on the card.
+  flushSdLogBuffer();
+  if (sdLogActive) {
+    sdLogFile.flush();
+  }
+
+  File f = SD.open(name, FILE_READ);
+  if (!f) {
+    Serial.print("[Log] ");
+    Serial.print(name);
+    Serial.println(" not found");
+    return;
+  }
+
+  Serial.print("[Log] DUMP BEGIN ");
+  Serial.print(name);
+  Serial.print(" ");
+  Serial.println((unsigned long)f.size());
+
+  uint8_t buf[32];
+  int n;
+  while ((n = f.read(buf, sizeof(buf))) > 0) {
+    for (int i = 0; i < n; i++) {
+      printCanHexByte(buf[i]);
+    }
+    Serial.println();
+  }
+  f.close();
+
+  Serial.println("[Log] DUMP END");
+}
+
 // ---------------- Display / touch ----------------
 void setupDisplay() {
   SPI.setMOSI(TFT_MOSI);
@@ -733,44 +1316,69 @@ void resetDisplay() {
   delay(150);
 }
 
-void handleSerialFanDutyInput() {
-  static char input[8];
+// Line-based serial console: 0-100 = manual fan duty, 'a' = auto fans,
+// 'l' = list log files, 'd<n>' = hex-dump log session n for export.
+void handleSerialConsoleInput() {
+  static char input[12];
   static uint8_t index = 0;
 
   while (Serial.available()) {
     char c = (char)Serial.read();
 
-    if (c >= '0' && c <= '9') {
-      if (index < sizeof(input) - 1) {
-        input[index++] = c;
-      }
-    } else if (c == 'a' || c == 'A') {
-      // Return fan control to automatic temperature-based duty.
-      fanManualOverride = false;
-      Serial.println("[Fans] Automatic temperature control resumed");
-      index = 0;
-    } else if (c == '\n' || c == '\r') {
+    if (c == '\n' || c == '\r') {
       if (index > 0) {
         input[index] = '\0';
-        int value = atoi(input);
-        // Manual override: enter 0-100 to force both fan PWM duties.
-        // Send 'a' to return to automatic temperature control.
-        if (value >= 0 && value <= 100) {
-          fanManualOverride = true;
-          fan1DutyPercent = value;
-          fan2DutyPercent = value;
-          Serial.print("[Fans] Manual override duty set to ");
-          Serial.print(value);
-          Serial.println("% (send 'a' for auto)");
-        } else {
-          Serial.println("[Fans] Enter a duty percent from 0 to 100, or 'a' for auto");
-        }
         index = 0;
+        handleSerialConsoleCommand(input);
       }
+    } else if (index < sizeof(input) - 1) {
+      input[index++] = c;
     } else {
       index = 0;
     }
   }
+}
+
+void handleSerialConsoleCommand(const char *cmd) {
+  if (strcmp(cmd, "a") == 0 || strcmp(cmd, "A") == 0) {
+    fanManualOverride = false;
+    Serial.println("[Fans] Automatic temperature control resumed");
+    return;
+  }
+
+  if (strcmp(cmd, "l") == 0 || strcmp(cmd, "L") == 0) {
+    listLogFiles();
+    return;
+  }
+
+  if ((cmd[0] == 'd' || cmd[0] == 'D') && cmd[1] >= '0' && cmd[1] <= '9') {
+    dumpLogFile((uint32_t)atoi(cmd + 1));
+    return;
+  }
+
+  bool allDigits = cmd[0] != '\0';
+  for (const char *p = cmd; *p; p++) {
+    if (*p < '0' || *p > '9') {
+      allDigits = false;
+      break;
+    }
+  }
+
+  if (allDigits) {
+    int value = atoi(cmd);
+    // Manual override: enter 0-100 to force both fan PWM duties.
+    if (value >= 0 && value <= 100) {
+      fanManualOverride = true;
+      fan1DutyPercent = value;
+      fan2DutyPercent = value;
+      Serial.print("[Fans] Manual override duty set to ");
+      Serial.print(value);
+      Serial.println("% (send 'a' for auto)");
+      return;
+    }
+  }
+
+  Serial.println("[Console] Commands: 0-100 fan duty, 'a' auto fans, 'l' list logs, 'd<n>' dump log n");
 }
 
 void handleTouch() {
@@ -2830,12 +3438,13 @@ void handlePm100ParamResponseFrame(const CAN_message_t &msg) {
   }
 
   uint16_t address = u16Le(msg.buf[0], msg.buf[1]);
-  if (address != PM100_PARAM_CAN_ACTIVE_MSGS) {
-    return;
+  if (address == PM100_PARAM_CAN_ACTIVE_MSGS) {
+    Serial.print("[PM100] CAN Active Messages parameter write ");
+    Serial.println(msg.buf[2] ? "succeeded" : "FAILED");
+  } else if (address == PM100_PARAM_FAULT_CLEAR) {
+    Serial.print("[PM100] Fault clear command ");
+    Serial.println(msg.buf[2] ? "accepted" : "REJECTED");
   }
-
-  Serial.print("[PM100] CAN Active Messages parameter write ");
-  Serial.println(msg.buf[2] ? "succeeded" : "FAILED");
 }
 
 // The 0x0A9 Internal Voltages broadcast (GLV voltage source) can be disabled
@@ -2885,6 +3494,64 @@ void sendPm100BroadcastEnable() {
   sendCanFrame(tx);
 }
 
+// Automatically clears latched PM100 faults over CAN once the conditions that
+// caused them are gone: the BMS must report contactors closed and the inverter
+// must see pack voltage on its DC bus again. Without this, an under-voltage
+// fault latched during an HV cycle or pack sag blocks torque until someone
+// power-cycles the inverter. Fault Clear is a command parameter (not an EEPROM
+// write), so it is safe to send any time; a fault whose cause is still present
+// simply latches again.
+void servicePm100FaultClear() {
+  if (!havePm100FaultStatus || !pm100Fault) {
+    return;
+  }
+
+  if (!haveBmsStatus || contactorsOpen()) {
+    pm100FaultClearAttempts = 0;
+    return;
+  }
+
+  if (!haveInverterVoltageInfo ||
+      inverterDcBusVoltage < PM100_FAULT_CLEAR_MIN_BUS_V) {
+    return;
+  }
+
+  if (pm100FaultClearAttempts >= PM100_FAULT_CLEAR_MAX_ATTEMPTS) {
+    return;
+  }
+
+  uint32_t now = millis();
+  if (pm100FaultClearAttempts > 0 &&
+      now - pm100FaultClearLastTxMs < PM100_FAULT_CLEAR_RETRY_MS) {
+    return;
+  }
+
+  pm100FaultClearAttempts++;
+  pm100FaultClearLastTxMs = now;
+
+  Serial.print("[PM100] Fault latched with contactors closed and bus at ");
+  Serial.print(inverterDcBusVoltage, 1);
+  Serial.print(" V; sending fault clear, attempt ");
+  Serial.println(pm100FaultClearAttempts);
+  sendPm100FaultClear();
+}
+
+void sendPm100FaultClear() {
+  CAN_message_t tx = {};
+  tx.id = PM100_PARAM_COMMAND_ID;
+  tx.len = 8;
+  tx.flags.extended = 0;
+  tx.buf[0] = (uint8_t)(PM100_PARAM_FAULT_CLEAR & 0xFF);
+  tx.buf[1] = (uint8_t)(PM100_PARAM_FAULT_CLEAR >> 8);
+  tx.buf[2] = 1;  // write
+  tx.buf[3] = 0;  // reserved
+  tx.buf[4] = 0;  // data 0 = clear all faults
+  tx.buf[5] = 0;
+  tx.buf[6] = 0;
+  tx.buf[7] = 0;
+  sendCanFrame(tx);
+}
+
 void handlePm100FaultCodesFrame(const CAN_message_t &msg) {
   if (msg.len < 8) {
     return;
@@ -2897,6 +3564,12 @@ void handlePm100FaultCodesFrame(const CAN_message_t &msg) {
   pm100Fault = (pm100PostFaults != 0 || pm100RunFaults != 0);
   if (pm100Fault && !previousFault) {
     showFaultBanner(firstPm100FaultName(pm100PostFaults, pm100RunFaults));
+  }
+  if (!pm100Fault) {
+    if (previousFault && pm100FaultClearAttempts > 0) {
+      Serial.println("[PM100] Faults cleared");
+    }
+    pm100FaultClearAttempts = 0;
   }
   screenDirty = true;
 }
@@ -3173,11 +3846,20 @@ void updatePedal() {
     pedalPct = (pedalPct - PEDAL_ZERO_DEADBAND_PCT) * 100.0f / (100.0f - PEDAL_ZERO_DEADBAND_PCT);
   }
 
-  // BSPC: zero torque while the brake (light-braking threshold) and
-  // accelerator >25% travel are applied together. Torque returns as soon as
-  // either pedal is released.
+  // BSPC: zero torque once the brake (light-braking threshold) and
+  // accelerator >25% travel are applied together. Per EV.4.7/T.4.7 this latches:
+  // once tripped, torque stays suppressed until the accelerator is released
+  // below 5% travel, regardless of brake state. Releasing the brake alone does
+  // not restore torque.
   bool bspcWasActive = bspcActive;
-  bspcActive = braking && pedalTravelPct > BSPC_APPS_THRESHOLD_PCT;
+  if (bspcActive) {
+    // Latched: only the accelerator returning below 5% travel clears the cut.
+    if (pedalTravelPct < BSPC_APPS_RESET_PCT) {
+      bspcActive = false;
+    }
+  } else if (braking && pedalTravelPct > BSPC_APPS_THRESHOLD_PCT) {
+    bspcActive = true;
+  }
   if (bspcActive != bspcWasActive) {
     Serial.println(bspcActive ? "[BSPC] Active; commanding zero torque"
                               : "[BSPC] Cleared");
