@@ -1,0 +1,1 @@
+This program listens on the RX pin of the CAN transciever, filters for BMS packets, and publishes BMS data via HTML. A Wi-Fi access point runs on the ESP32.
